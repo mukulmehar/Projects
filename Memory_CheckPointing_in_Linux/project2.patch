@@ -1,0 +1,280 @@
+From f4c76fe77997cf1b9c0baab30127125519c4a48a Mon Sep 17 00:00:00 2001
+From: Mukul Mehar <mukulmehar02@gmail.com>
+Date: Fri, 24 Mar 2023 01:41:37 +0530
+Subject: [PATCH] Adding mmcontext syscall
+
+Adding a new system call in mmcontext/ which saves and restores the context of a process such as its dynamically allocated anonymous memory.
+
+Signed-off-by: Mukul Mehar <mukulmehar02@gmail.com>
+---
+ Makefile                               |   4 +-
+ arch/x86/entry/syscalls/syscall_64.tbl |   1 +
+ include/linux/mm_types.h               |   1 +
+ include/linux/sched.h                  |   8 ++
+ include/linux/syscalls.h               |   1 +
+ kernel/exit.c                          |  11 +++
+ kernel/fork.c                          |   2 +
+ mmcontext/Makefile                     |   1 +
+ mmcontext/mmcontext.c                  | 125 +++++++++++++++++++++++++
+ 9 files changed, 152 insertions(+), 2 deletions(-)
+ create mode 100644 mmcontext/Makefile
+ create mode 100644 mmcontext/mmcontext.c
+
+diff --git a/Makefile b/Makefile
+index b978809a1..d8d7c9a3a 100644
+--- a/Makefile
++++ b/Makefile
+@@ -2,7 +2,7 @@
+ VERSION = 6
+ PATCHLEVEL = 0
+ SUBLEVEL = 19
+-EXTRAVERSION =
++EXTRAVERSION = 
+ NAME = Hurr durr I'ma ninja sloth
+ 
+ # *DOCUMENTATION*
+@@ -1101,7 +1101,7 @@ export MODORDER := $(extmod_prefix)modules.order
+ export MODULES_NSDEPS := $(extmod_prefix)modules.nsdeps
+ 
+ ifeq ($(KBUILD_EXTMOD),)
+-core-y			+= kernel/ certs/ mm/ fs/ ipc/ security/ crypto/
++core-y			+= kernel/ certs/ mm/ fs/ ipc/ security/ crypto/ mmcontext/
+ core-$(CONFIG_BLOCK)	+= block/
+ core-$(CONFIG_IO_URING)	+= io_uring/
+ 
+diff --git a/arch/x86/entry/syscalls/syscall_64.tbl b/arch/x86/entry/syscalls/syscall_64.tbl
+index c84d12608..36fd35346 100644
+--- a/arch/x86/entry/syscalls/syscall_64.tbl
++++ b/arch/x86/entry/syscalls/syscall_64.tbl
+@@ -372,6 +372,7 @@
+ 448	common	process_mrelease	sys_process_mrelease
+ 449	common	futex_waitv		sys_futex_waitv
+ 450	common	set_mempolicy_home_node	sys_set_mempolicy_home_node
++451	common	mmcontext		sys_mmcontext
+ 
+ #
+ # Due to a historical design error, certain syscalls are numbered differently
+diff --git a/include/linux/mm_types.h b/include/linux/mm_types.h
+index cf97f3884..e1617d743 100644
+--- a/include/linux/mm_types.h
++++ b/include/linux/mm_types.h
+@@ -678,6 +678,7 @@ struct mm_struct {
+ 	 * The mm_cpumask needs to be at the end of mm_struct, because it
+ 	 * is dynamically sized based on nr_cpu_ids.
+ 	 */
++
+ 	unsigned long cpu_bitmap[];
+ };
+ 
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index 8d82d6d32..22f03d626 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -724,6 +724,13 @@ struct kmap_ctrl {
+ #endif
+ };
+ 
++struct p_context {
++    unsigned long addr;
++    unsigned long size;
++    void *buffer;
++    struct list_head list;
++};
++
+ struct task_struct {
+ #ifdef CONFIG_THREAD_INFO_IN_TASK
+ 	/*
+@@ -859,6 +866,7 @@ struct task_struct {
+ 
+ 	struct mm_struct		*mm;
+ 	struct mm_struct		*active_mm;
++	struct list_head		context;		// Page Wise context
+ 
+ 	/* Per-thread vma caching: */
+ 	struct vmacache			vmacache;
+diff --git a/include/linux/syscalls.h b/include/linux/syscalls.h
+index a34b0f9a9..e008d49b3 100644
+--- a/include/linux/syscalls.h
++++ b/include/linux/syscalls.h
+@@ -1385,4 +1385,5 @@ int __sys_getsockopt(int fd, int level, int optname, char __user *optval,
+ 		int __user *optlen);
+ int __sys_setsockopt(int fd, int level, int optname, char __user *optval,
+ 		int optlen);
++asmlinkage long sys_mmcontext(int state);
+ #endif
+diff --git a/kernel/exit.c b/kernel/exit.c
+index 84021b24f..43d2d4f5a 100644
+--- a/kernel/exit.c
++++ b/kernel/exit.c
+@@ -833,6 +833,17 @@ void __noreturn do_exit(long code)
+ 	if (tsk->task_frag.page)
+ 		put_page(tsk->task_frag.page);
+ 
++	// Free the process context structures and kernel buffer
++	if (!list_empty(&tsk -> context)) {
++		struct p_context *pctx;
++		while (!list_empty(&tsk -> context)) {
++			pctx = list_first_entry(&tsk -> context, struct p_context, list);
++			list_del(&pctx->list);
++			kfree(pctx->buffer);
++			kfree(pctx);
++		}
++	}
++
+ 	validate_creds_for_do_exit(tsk);
+ 	exit_task_stack_account(tsk);
+ 
+diff --git a/kernel/fork.c b/kernel/fork.c
+index f925d2b96..cf454f7c7 100644
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@ -2352,6 +2352,8 @@ static __latent_entropy struct task_struct *copy_process(
+ 	p->rethooks.first = NULL;
+ #endif
+ 
++	INIT_LIST_HEAD(&p -> context);
++
+ 	/*
+ 	 * Ensure that the cgroup subsystem policies allow the new process to be
+ 	 * forked. It should be noted that the new process's css_set can be changed
+diff --git a/mmcontext/Makefile b/mmcontext/Makefile
+new file mode 100644
+index 000000000..5f24d319c
+--- /dev/null
++++ b/mmcontext/Makefile
+@@ -0,0 +1 @@
++obj-y := mmcontext.o
+diff --git a/mmcontext/mmcontext.c b/mmcontext/mmcontext.c
+new file mode 100644
+index 000000000..118d82692
+--- /dev/null
++++ b/mmcontext/mmcontext.c
+@@ -0,0 +1,125 @@
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/syscalls.h>
++#include <linux/slab.h>
++#include <linux/sched.h>
++#include <linux/types.h>
++#include <linux/mm.h>
++#include <linux/errno.h>
++
++// struct p_context {
++//     unsigned long addr;
++//     unsigned long size;
++//     void *buffer;
++//     struct list_head list;
++// };
++
++SYSCALL_DEFINE1(mmcontext, int, state)
++{
++    struct task_struct *task;
++    int res;
++    struct mm_struct *mm;
++    struct vm_area_struct *vma;
++    unsigned long start_addr, end_addr, curr_addr, size;
++    struct p_context *pctx, *pctx_vma;
++    if (state == 0) {
++        task = current;
++        if(!list_empty(&task -> context)) {
++            printk(KERN_INFO "Process already has its context saved\n");
++            return -EINVAL;
++        }
++
++        mm = task->mm;
++
++        /* First copying heap memory */
++        start_addr = mm->start_brk;
++        end_addr = mm->brk;
++        curr_addr = start_addr;
++        size = end_addr - start_addr;
++        pctx = kmalloc(sizeof(struct p_context), GFP_KERNEL);
++        if (!pctx) {
++            printk(KERN_ERR "Failed to allocate memory for page context\n");
++            return -ENOMEM;
++        }
++        pctx->addr = curr_addr;
++        pctx->size = size;
++        pctx->buffer = kmalloc(size, GFP_KERNEL);
++        INIT_LIST_HEAD(&pctx->list);
++        if (!pctx -> buffer) {
++            printk(KERN_ERR "Failed to allocate memory for page context buffer\n");
++            return -ENOMEM;
++            kfree(pctx);
++        }
++
++        res = copy_from_user(pctx->buffer, (void *)curr_addr, size);
++        if (res != 0) {
++            printk(KERN_ERR "Failed to copy %d bytes from userspace to kernel space\n", res);
++        }
++
++        list_add(&pctx->list, &task -> context);
++
++        /* Now copying right vma's */
++        vma = mm->mmap;
++        while (vma) {
++            if ((vma -> vm_file == NULL) && ((vma -> vm_start >= mm->start_data) && (vma -> vm_end <= mm->end_data))) {
++                start_addr = vma->vm_start;
++                end_addr = vma->vm_end;
++                curr_addr = start_addr;
++                size = end_addr - start_addr;
++                pctx_vma = kmalloc(sizeof(struct p_context), GFP_KERNEL);
++                if (!pctx_vma) {
++                    printk(KERN_ERR "Failed to allocate memory for page context\n");
++                    return -ENOMEM;
++                }
++                pctx_vma->addr = curr_addr;
++                pctx_vma->size = size;
++                pctx_vma->buffer = kmalloc(size, GFP_KERNEL);
++                INIT_LIST_HEAD(&pctx_vma->list);
++                if (!pctx_vma -> buffer) {
++                    printk(KERN_ERR "Failed to allocate memory for page context buffer\n");
++                    kfree(pctx_vma);
++                    return -ENOMEM;
++                }
++
++                res = copy_from_user(pctx_vma->buffer, (void *)curr_addr, size);
++                if (res != 0) {
++                    printk(KERN_ERR "Failed to copy %d bytes from userspace to kernel space\n", res);
++                    return -EFAULT;
++                }
++
++                list_add(&pctx_vma->list, &task -> context);
++            }
++            vma = vma->vm_next;
++        }
++        return 0;
++    } else if (state == 1) {
++        task = current;
++        if(list_empty(&task -> context)) {
++            printk(KERN_INFO "Process has not saved its context.\n");
++            return -EINVAL;
++        }
++
++        mm = task -> mm;
++
++        list_for_each_entry(pctx, &task -> context, list) {
++            res = copy_to_user((void *)pctx->addr, pctx->buffer, pctx->size);
++            if (res != 0) {
++                printk(KERN_ERR "Failed to copy %d bytes from kernel space to userspace\n", res);
++                return -EFAULT;
++            }
++        }
++
++        /* Free the process context structures and kernel buffer */
++        while (!list_empty(&task -> context)) {
++            pctx = list_first_entry(&task -> context, struct p_context, list);
++            list_del(&pctx->list);
++            kfree(pctx->buffer);
++            kfree(pctx);
++        }
++
++        return 0;
++    }
++
++    return -EINVAL;
++}
++         
+-- 
+2.25.1
+
